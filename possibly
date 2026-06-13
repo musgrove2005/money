@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""
+Options Strategy Scanner
+========================
+Pulls live market data from Yahoo Finance (via yfinance) and builds six
+candidate options strategies around a target expiration, with payoff math
+for each:
+
+  1. Covered call          (income / mildly bullish)
+  2. Cash-secured put      (income / get paid to wait for a dip)
+  3. Bull call spread      (defined-risk bullish)
+  4. Bear put spread       (defined-risk bearish)
+  5. Iron condor           (defined-risk neutral, sells premium)
+  6. Long straddle         (big move expected, direction unknown)
+
+Setup (one time):
+    pip install yfinance pandas numpy
+
+Usage:
+    python options_strategy_scanner.py AAPL
+    python options_strategy_scanner.py SPY --dte 45
+    python options_strategy_scanner.py NVDA --expiry 2026-07-17
+
+Educational tool only -- NOT financial advice. Options can lose value fast.
+"""
+
+import argparse
+import math
+import sys
+from datetime import date, datetime
+
+import numpy as np
+import pandas as pd
+
+try:
+    import yfinance as yf
+except ImportError:
+    sys.exit("Missing dependency. Run:  pip install yfinance pandas numpy")
+
+TRADING_DAYS = 252
+SEP = "-" * 64
+
+
+# ---------------------------------------------------------------------------
+# Black-Scholes helpers (yfinance chains include IV but not greeks)
+# ---------------------------------------------------------------------------
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_delta(spot, strike, t_years, iv, rfr, kind):
+    """Black-Scholes delta. kind = 'call' or 'put'."""
+    try:
+        if t_years <= 0 or not iv or iv <= 0 or strike <= 0:
+            return None
+        d1 = (math.log(spot / strike) + (rfr + 0.5 * iv * iv) * t_years) / (
+            iv * math.sqrt(t_years))
+        return norm_cdf(d1) if kind == "call" else norm_cdf(d1) - 1.0
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Data fetching / preparation
+# ---------------------------------------------------------------------------
+
+def get_risk_free_rate() -> float:
+    """13-week T-bill yield (^IRX); falls back to 4.5% if unavailable."""
+    try:
+        px = yf.Ticker("^IRX").history(period="5d")["Close"].dropna()
+        if len(px):
+            return float(px.iloc[-1]) / 100.0
+    except Exception:
+        pass
+    return 0.045
+
+
+def fetch_underlying(ticker: str):
+    tk = yf.Ticker(ticker)
+    hist = tk.history(period="1y")
+    if hist.empty:
+        sys.exit(f"No price history found for '{ticker}'. Check the symbol.")
+    closes = hist["Close"].dropna()
+    spot = float(closes.iloc[-1])
+    rets = np.log(closes / closes.shift(1)).dropna()
+    hv_1y = float(rets.std() * math.sqrt(TRADING_DAYS))
+    hv_30 = float(rets.tail(21).std() * math.sqrt(TRADING_DAYS))
+    sma50 = float(closes.tail(50).mean())
+    expiries = list(tk.options or [])
+    if not expiries:
+        sys.exit(f"'{ticker}' has no listed options on Yahoo Finance.")
+    return tk, spot, hv_30, hv_1y, sma50, expiries
+
+
+def choose_expiry(expiries, target_dte, explicit=None):
+    today = date.today()
+    if explicit:
+        if explicit not in expiries:
+            sys.exit(f"Expiry {explicit} not available. Choices:\n  "
+                     + "\n  ".join(expiries[:14]))
+        d = datetime.strptime(explicit, "%Y-%m-%d").date()
+        return explicit, (d - today).days
+    best, best_dte = None, None
+    for e in expiries:
+        dte = (datetime.strptime(e, "%Y-%m-%d").date() - today).days
+        if dte < 7:  # skip ultra-short-dated
+            continue
+        if best is None or abs(dte - target_dte) < abs(best_dte - target_dte):
+            best, best_dte = e, dte
+    if best is None:
+        best = expiries[-1]
+        best_dte = (datetime.strptime(best, "%Y-%m-%d").date() - today).days
+    return best, best_dte
+
+
+def prepare_chain(df, spot, t_years, rfr, kind):
+    """Clean one side of the chain; add mid price and Black-Scholes delta."""
+    df = df.copy()
+    for col in ("bid", "ask", "lastPrice", "volume", "openInterest",
+                "impliedVolatility"):
+        if col not in df:
+            df[col] = np.nan
+    df["volume"] = df["volume"].fillna(0)
+    df["openInterest"] = df["openInterest"].fillna(0)
+
+    def midprice(row):
+        b, a = row["bid"], row["ask"]
+        if pd.notna(b) and pd.notna(a) and b > 0 and a >= b:
+            return (b + a) / 2.0
+        lp = row["lastPrice"]
+        return lp if pd.notna(lp) and lp > 0 else np.nan
+
+    df["mid"] = df.apply(midprice, axis=1)
+    df["delta"] = df.apply(
+        lambda row: bs_delta(spot, row["strike"], t_years,
+                             row["impliedVolatility"], rfr, kind), axis=1)
+    df = df.dropna(subset=["mid", "delta"])
+    df = df[df["impliedVolatility"] > 0.01]
+
+    liquid = df[(df["openInterest"] >= 10) | (df["volume"] >= 5)]
+    out = liquid if len(liquid) >= 5 else df
+    return out.sort_values("strike").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Strike selection helpers
+# ---------------------------------------------------------------------------
+
+def by_delta(df, target):
+    if df.empty:
+        return None
+    return df.loc[(df["delta"] - target).abs().idxmin()]
+
+
+def atm_row(df, spot):
+    if df.empty:
+        return None
+    return df.loc[(df["strike"] - spot).abs().idxmin()]
+
+
+def wing_row(df, short_strike, direction, steps=2):
+    """Pick a long 'wing' a couple of strikes beyond the short strike."""
+    strikes = df["strike"].tolist()
+    if short_strike not in strikes:
+        return None
+    idx = strikes.index(short_strike) + direction * steps
+    idx = max(0, min(len(strikes) - 1, idx))
+    if strikes[idx] == short_strike:
+        return None
+    return df[df["strike"] == strikes[idx]].iloc[0]
+
+
+def common_atm_strike(calls, puts, spot):
+    common = sorted(set(calls["strike"]).intersection(set(puts["strike"])))
+    if not common:
+        return None
+    return min(common, key=lambda k: abs(k - spot))
+
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+
+def money(x):
+    sign = "-" if x < 0 else ""
+    return f"{sign}${abs(x):,.2f}"
+
+
+def leg(action, row, expiry, kind):
+    return (f"   {action:<4} 1x {expiry} {row['strike']:g}{kind[0].upper()} "
+            f"@ {money(row['mid'])}   "
+            f"(delta {row['delta']:+.2f}, OI {int(row['openInterest']):,})")
+
+
+# ---------------------------------------------------------------------------
+# Strategy builders -- each returns a printable block or None
+# ---------------------------------------------------------------------------
+
+def covered_call(spot, calls, expiry, dte):
+    row = by_delta(calls, 0.30)
+    if row is None or row["strike"] <= spot:
+        return None
+    prem, K = row["mid"], row["strike"]
+    outlay = (spot - prem) * 100
+    max_profit = (K - spot + prem) * 100
+    yld = prem / spot
+    ann = yld * 365 / max(dte, 1)
+    return "\n".join([
+        "COVERED CALL   (income / mildly bullish)",
+        f"   BUY  100 shares @ {money(spot)}",
+        leg("SELL", row, expiry, "call"),
+        f"   Net outlay:     {money(outlay)}",
+        f"   Max profit:     {money(max_profit)} (shares called away above {K:g})",
+        f"   Max loss:       {money(outlay)} (stock to zero, cushioned by premium)",
+        f"   Breakeven:      {money(spot - prem)}",
+        f"   Premium yield:  {yld*100:.2f}% ({ann*100:.1f}% annualized)",
+        f"   Approx. prob. of assignment: {row['delta']*100:.0f}%",
+    ])
+
+
+def cash_secured_put(spot, puts, expiry, dte):
+    row = by_delta(puts, -0.30)
+    if row is None or row["strike"] >= spot:
+        return None
+    prem, K = row["mid"], row["strike"]
+    yld = prem / K
+    ann = yld * 365 / max(dte, 1)
+    return "\n".join([
+        "CASH-SECURED PUT   (income / willing to buy the dip)",
+        leg("SELL", row, expiry, "put"),
+        f"   Collateral:     {money(K * 100)} cash set aside",
+        f"   Max profit:     {money(prem * 100)} (expires worthless above {K:g})",
+        f"   Max loss:       {money((K - prem) * 100)} (stock to zero, assigned at {K:g})",
+        f"   Breakeven:      {money(K - prem)}",
+        f"   Premium yield:  {yld*100:.2f}% on collateral ({ann*100:.1f}% annualized)",
+        f"   Approx. prob. of keeping full premium: {(1 - abs(row['delta']))*100:.0f}%",
+    ])
+
+
+def bull_call_spread(spot, calls, expiry):
+    long_row = atm_row(calls, spot)
+    short_row = by_delta(calls, 0.30)
+    if (long_row is None or short_row is None
+            or short_row["strike"] <= long_row["strike"]):
+        return None
+    debit = long_row["mid"] - short_row["mid"]
+    if debit <= 0:
+        return None
+    width = short_row["strike"] - long_row["strike"]
+    max_profit = (width - debit) * 100
+    if max_profit <= 0:
+        return None
+    return "\n".join([
+        "BULL CALL SPREAD   (defined-risk bullish)",
+        leg("BUY", long_row, expiry, "call"),
+        leg("SELL", short_row, expiry, "call"),
+        f"   Net debit:      {money(debit * 100)}",
+        f"   Max profit:     {money(max_profit)} above {short_row['strike']:g}",
+        f"   Max loss:       {money(debit * 100)} below {long_row['strike']:g}",
+        f"   Breakeven:      {money(long_row['strike'] + debit)}",
+        f"   Reward/risk:    {max_profit / (debit * 100):.2f}x",
+    ])
+
+
+def bear_put_spread(spot, puts, expiry):
+    long_row = atm_row(puts, spot)
+    short_row = by_delta(puts, -0.30)
+    if (long_row is None or short_row is None
+            or short_row["strike"] >= long_row["strike"]):
+        return None
+    debit = long_row["mid"] - short_row["mid"]
+    if debit <= 0:
+        return None
+    width = long_row["strike"] - short_row["strike"]
+    max_profit = (width - debit) * 100
+    if max_profit <= 0:
+        return None
+    return "\n".join([
+        "BEAR PUT SPREAD   (defined-risk bearish)",
+        leg("BUY", long_row, expiry, "put"),
+        leg("SELL", short_row, expiry, "put"),
+        f"   Net debit:      {money(debit * 100)}",
+        f"   Max profit:     {money(max_profit)} below {short_row['strike']:g}",
+        f"   Max loss:       {money(debit * 100)} above {long_row['strike']:g}",
+        f"   Breakeven:      {money(long_row['strike'] - debit)}",
+        f"   Reward/risk:    {max_profit / (debit * 100):.2f}x",
+    ])
+
+
+def iron_condor(spot, calls, puts, expiry):
+    sc = by_delta(calls, 0.20)
+    sp = by_delta(puts, -0.20)
+    if sc is None or sp is None:
+        return None
+    if not (sp["strike"] < spot < sc["strike"]):
+        return None
+    lc = wing_row(calls, sc["strike"], +1, steps=2)
+    lp = wing_row(puts, sp["strike"], -1, steps=2)
+    if lc is None or lp is None:
+        return None
+    credit = sc["mid"] + sp["mid"] - lc["mid"] - lp["mid"]
+    if credit <= 0:
+        return None
+    width = max(lc["strike"] - sc["strike"], sp["strike"] - lp["strike"])
+    max_loss = (width - credit) * 100
+    if max_loss <= 0:
+        return None
+    pop = max(0.0, 1 - (sc["delta"] + abs(sp["delta"])))
+    return "\n".join([
+        "IRON CONDOR   (defined-risk neutral, collects premium)",
+        leg("SELL", sp, expiry, "put"),
+        leg("BUY", lp, expiry, "put"),
+        leg("SELL", sc, expiry, "call"),
+        leg("BUY", lc, expiry, "call"),
+        f"   Net credit:     {money(credit * 100)}",
+        f"   Max profit:     {money(credit * 100)} between "
+        f"{sp['strike']:g} and {sc['strike']:g}",
+        f"   Max loss:       {money(max_loss)}",
+        f"   Breakevens:     {money(sp['strike'] - credit)} / "
+        f"{money(sc['strike'] + credit)}",
+        f"   Approx. prob. of profit: {pop*100:.0f}%",
+    ])
+
+
+def long_straddle(calls, puts, spot, expiry, exp_move):
+    K = common_atm_strike(calls, puts, spot)
+    if K is None:
+        return None
+    c = calls[calls["strike"] == K].iloc[0]
+    p = puts[puts["strike"] == K].iloc[0]
+    debit = c["mid"] + p["mid"]
+    if debit <= 0:
+        return None
+    lines = [
+        "LONG STRADDLE   (expects a big move, direction unknown)",
+        leg("BUY", c, expiry, "call"),
+        leg("BUY", p, expiry, "put"),
+        f"   Net debit:      {money(debit * 100)} (= max loss if pinned at {K:g})",
+        f"   Breakevens:     {money(K - debit)} / {money(K + debit)}",
+        f"   Needs a move bigger than {money(debit)} "
+        f"({debit / spot * 100:.1f}%) by expiry to profit",
+    ]
+    if exp_move:
+        lines.append(f"   Market-implied expected move: +/- {money(exp_move)} "
+                     f"({exp_move / spot * 100:.1f}%)")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Options strategy scanner using live Yahoo Finance data.")
+    ap.add_argument("ticker", help="stock or ETF symbol, e.g. AAPL")
+    ap.add_argument("--dte", type=int, default=35,
+                    help="target days to expiry (default 35)")
+    ap.add_argument("--expiry", help="exact expiry date, YYYY-MM-DD")
+    args = ap.parse_args()
+    ticker = args.ticker.upper()
+
+    print(f"Fetching data for {ticker} ...")
+    rfr = get_risk_free_rate()
+    tk, spot, hv30, hv1y, sma50, expiries = fetch_underlying(ticker)
+    expiry, dte = choose_expiry(expiries, args.dte, args.expiry)
+    t_years = max(dte, 1) / 365.0
+
+    chain = tk.option_chain(expiry)
+    calls = prepare_chain(chain.calls, spot, t_years, rfr, "call")
+    puts = prepare_chain(chain.puts, spot, t_years, rfr, "put")
+    if calls.empty or puts.empty:
+        sys.exit("Option chain too thin at this expiry. Try another --expiry.")
+
+    # Volatility snapshot
+    ivs = [r["impliedVolatility"] for r in (atm_row(calls, spot),
+                                            atm_row(puts, spot)) if r is not None]
+    atm_iv = float(np.mean(ivs)) if ivs else float("nan")
+    exp_move = (spot * atm_iv * math.sqrt(t_years)
+                if not math.isnan(atm_iv) else None)
+    iv_hv = atm_iv / hv30 if hv30 and not math.isnan(atm_iv) else float("nan")
+
+    if not math.isnan(iv_hv) and iv_hv >= 1.2:
+        regime = ("RICH -- options look pricey vs realized vol. "
+                  "Edge favors SELLING premium\n   (covered call, "
+                  "cash-secured put, iron condor).")
+    elif not math.isnan(iv_hv) and iv_hv <= 0.8:
+        regime = ("CHEAP -- options look inexpensive vs realized vol. "
+                  "Edge favors BUYING\n   (debit spreads, long straddle).")
+    else:
+        regime = ("FAIR -- no strong edge from IV alone. Lean on your "
+                  "directional view\n   and keep position sizes small.")
+
+    trend = "ABOVE" if spot >= sma50 else "BELOW"
+
+    print()
+    print("=" * 64)
+    print(f" OPTIONS STRATEGY SCANNER -- {ticker}")
+    print("=" * 64)
+    print(f" Date:           {date.today()}      Risk-free rate: {rfr*100:.2f}%")
+    print(f" Spot price:     {money(spot)}")
+    print(f" 50-day SMA:     {money(sma50)}  (trading {trend} trend line)")
+    print(f" Expiry used:    {expiry}  ({dte} DTE)")
+    if not math.isnan(atm_iv):
+        print(f" ATM implied vol: {atm_iv*100:.1f}%   "
+              f"Expected move: +/- {money(exp_move)} "
+              f"({exp_move/spot*100:.1f}%)")
+    print(f" Realized vol:   30d {hv30*100:.1f}%  |  1y {hv1y*100:.1f}%")
+    if not math.isnan(iv_hv):
+        print(f" IV / HV(30d):   {iv_hv:.2f}x -> {regime}")
+    print(SEP)
+
+    builders = [
+        lambda: covered_call(spot, calls, expiry, dte),
+        lambda: cash_secured_put(spot, puts, expiry, dte),
+        lambda: bull_call_spread(spot, calls, expiry),
+        lambda: bear_put_spread(spot, puts, expiry),
+        lambda: iron_condor(spot, calls, puts, expiry),
+        lambda: long_straddle(calls, puts, spot, expiry, exp_move),
+    ]
+    shown = 0
+    for build in builders:
+        try:
+            block = build()
+        except Exception:
+            block = None
+        if block:
+            print(block)
+            print(SEP)
+            shown += 1
+    if shown == 0:
+        print("No viable strategies found (chain too illiquid). "
+              "Try a more liquid ticker or different expiry.")
+
+    print("NOTES & ASSUMPTIONS")
+    print(" - Prices use bid/ask midpoints (or last trade when quotes are")
+    print("   missing); real fills will be worse. Fees not included.")
+    print(" - Deltas are Black-Scholes estimates -- rough probability")
+    print("   proxies only. Dividends and early assignment are ignored.")
+    print(" - Educational output only. Not financial advice.")
+
+
+if __name__ == "__main__":
+    main()
