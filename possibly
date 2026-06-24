@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
 """
-Options Strategy Scanner
-========================
-Pulls live market data from Yahoo Finance (via yfinance) and builds six
-candidate options strategies around a target expiration, with payoff math
-for each:
+Options Strategy Scanner (Enhanced)
+====================================
+New in this version:
+  - Unusual Whales flow sentiment  (set UNUSUAL_WHALES_API_KEY env var)
+  - IV Rank / IV Percentile        (vs 1-year rolling HV range)
+  - Earnings awareness             (warns when expiry straddles an earnings event)
+  - Full Greeks: gamma, theta, vega on every leg + net per strategy
+  - Bid/ask spread quality score   (tight / ok / wide)
+  - Backtest: 1-year iron condor win-rate simulation
 
-  1. Covered call          (income / mildly bullish)
-  2. Cash-secured put      (income / get paid to wait for a dip)
-  3. Bull call spread      (defined-risk bullish)
-  4. Bear put spread       (defined-risk bearish)
-  5. Iron condor           (defined-risk neutral, sells premium)
-  6. Long straddle         (big move expected, direction unknown)
-
-Setup (one time):
-    pip install yfinance pandas numpy
+Setup:
+    pip install yfinance pandas numpy requests
 
 Usage:
-    python options_strategy_scanner.py AAPL
-    python options_strategy_scanner.py SPY --dte 45
-    python options_strategy_scanner.py NVDA --expiry 2026-07-17
-
-Educational tool only -- NOT financial advice. Options can lose value fast.
+    python possibly AAPL
+    python possibly SPY --dte 45
+    python possibly NVDA --expiry 2026-07-17
+    UNUSUAL_WHALES_API_KEY=xxx python possibly AAPL
 """
 
 import argparse
 import math
+import os
 import sys
 from datetime import date, datetime
 
@@ -35,38 +32,82 @@ import pandas as pd
 try:
     import yfinance as yf
 except ImportError:
-    sys.exit("Missing dependency. Run:  pip install yfinance pandas numpy")
+    sys.exit("Missing dependency. Run:  pip install yfinance pandas numpy requests")
+
+try:
+    import requests as _requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 TRADING_DAYS = 252
-SEP = "-" * 64
+SEP = "-" * 72
+UW_API_BASE = "https://api.unusualwhales.com"
 
 
 # ---------------------------------------------------------------------------
-# Black-Scholes helpers (yfinance chains include IV but not greeks)
+# Black-Scholes -- full Greeks
 # ---------------------------------------------------------------------------
 
-def norm_cdf(x: float) -> float:
+def _norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def bs_delta(spot, strike, t_years, iv, rfr, kind):
-    """Black-Scholes delta. kind = 'call' or 'put'."""
+def _norm_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _bs_price(spot, strike, t, iv, rfr, kind):
+    """Black-Scholes theoretical price."""
     try:
-        if t_years <= 0 or not iv or iv <= 0 or strike <= 0:
-            return None
+        if t <= 0 or iv <= 0:
+            return 0.0
+        d1 = (math.log(spot / strike) + (rfr + 0.5 * iv * iv) * t) / (iv * math.sqrt(t))
+        d2 = d1 - iv * math.sqrt(t)
+        disc = math.exp(-rfr * t)
+        if kind == "call":
+            return spot * _norm_cdf(d1) - strike * disc * _norm_cdf(d2)
+        return strike * disc * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return 0.0
+
+
+def bs_greeks(spot, strike, t_years, iv, rfr, kind):
+    """
+    Full Black-Scholes Greeks.
+    Returns dict with delta, gamma, theta ($/share/day), vega ($/share per 1% IV).
+    Returns {} on bad inputs.
+    """
+    try:
+        if t_years <= 0 or iv <= 0 or strike <= 0 or spot <= 0:
+            return {}
         d1 = (math.log(spot / strike) + (rfr + 0.5 * iv * iv) * t_years) / (
             iv * math.sqrt(t_years))
-        return norm_cdf(d1) if kind == "call" else norm_cdf(d1) - 1.0
-    except (ValueError, ZeroDivisionError):
-        return None
+        d2 = d1 - iv * math.sqrt(t_years)
+        nd1 = _norm_pdf(d1)
+        sqrt_t = math.sqrt(t_years)
+        disc = math.exp(-rfr * t_years)
+
+        delta = _norm_cdf(d1) if kind == "call" else _norm_cdf(d1) - 1.0
+        gamma = nd1 / (spot * iv * sqrt_t)
+        vega = spot * nd1 * sqrt_t / 100.0          # per 1% IV move, per share
+        if kind == "call":
+            theta = (-(spot * nd1 * iv) / (2 * sqrt_t)
+                     - rfr * strike * disc * _norm_cdf(d2)) / 365.0
+        else:
+            theta = (-(spot * nd1 * iv) / (2 * sqrt_t)
+                     + rfr * strike * disc * _norm_cdf(-d2)) / 365.0
+
+        return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return {}
 
 
 # ---------------------------------------------------------------------------
-# Data fetching / preparation
+# Data fetching
 # ---------------------------------------------------------------------------
 
-def get_risk_free_rate() -> float:
-    """13-week T-bill yield (^IRX); falls back to 4.5% if unavailable."""
+def get_risk_free_rate():
     try:
         px = yf.Ticker("^IRX").history(period="5d")["Close"].dropna()
         if len(px):
@@ -76,7 +117,7 @@ def get_risk_free_rate() -> float:
     return 0.045
 
 
-def fetch_underlying(ticker: str):
+def fetch_underlying(ticker):
     tk = yf.Ticker(ticker)
     hist = tk.history(period="1y")
     if hist.empty:
@@ -84,41 +125,182 @@ def fetch_underlying(ticker: str):
     closes = hist["Close"].dropna()
     spot = float(closes.iloc[-1])
     rets = np.log(closes / closes.shift(1)).dropna()
-    hv_1y = float(rets.std() * math.sqrt(TRADING_DAYS))
     hv_30 = float(rets.tail(21).std() * math.sqrt(TRADING_DAYS))
+    hv_1y = float(rets.std() * math.sqrt(TRADING_DAYS))
     sma50 = float(closes.tail(50).mean())
     expiries = list(tk.options or [])
     if not expiries:
         sys.exit(f"'{ticker}' has no listed options on Yahoo Finance.")
-    return tk, spot, hv_30, hv_1y, sma50, expiries
+    return tk, spot, hv_30, hv_1y, sma50, closes, expiries
 
 
-def choose_expiry(expiries, target_dte, explicit=None):
-    today = date.today()
-    if explicit:
-        if explicit not in expiries:
-            sys.exit(f"Expiry {explicit} not available. Choices:\n  "
-                     + "\n  ".join(expiries[:14]))
-        d = datetime.strptime(explicit, "%Y-%m-%d").date()
-        return explicit, (d - today).days
-    best, best_dte = None, None
-    for e in expiries:
-        dte = (datetime.strptime(e, "%Y-%m-%d").date() - today).days
-        if dte < 7:  # skip ultra-short-dated
+def get_iv_rank(closes, current_iv):
+    """
+    IV Rank and IV Percentile vs 1-year rolling 30d realized vol.
+    Uses HV as an IV proxy -- conservative but practical without historical IV data.
+    Returns (iv_rank, iv_percentile).
+    """
+    rets = np.log(closes / closes.shift(1)).dropna()
+    hv_series = rets.rolling(21).std() * math.sqrt(TRADING_DAYS)
+    hv_series = hv_series.dropna()
+    if len(hv_series) < 20:
+        return float("nan"), float("nan")
+    lo, hi = float(hv_series.min()), float(hv_series.max())
+    if hi <= lo:
+        return float("nan"), float("nan")
+    rank = max(0.0, min(100.0, (current_iv - lo) / (hi - lo) * 100))
+    pct = float((hv_series < current_iv).mean() * 100)
+    return rank, pct
+
+
+def get_earnings_date(tk):
+    """Returns next earnings date or None."""
+    try:
+        cal = tk.calendar
+        if cal is None:
+            return None
+        if isinstance(cal, dict):
+            dates = cal.get("Earnings Date", [])
+            if dates:
+                d = dates[0]
+                return d.date() if hasattr(d, "date") else d
+        if isinstance(cal, pd.DataFrame) and not cal.empty:
+            for col in ("Earnings Date", "Earnings Date Start"):
+                if col in cal.columns:
+                    val = cal[col].iloc[0]
+                    return val.date() if hasattr(val, "date") else val
+            if "Earnings Date" in cal.index:
+                val = cal.loc["Earnings Date"].iloc[0]
+                return val.date() if hasattr(val, "date") else val
+    except Exception:
+        pass
+    return None
+
+
+def get_unusual_flow(ticker):
+    """
+    Fetch recent option flow from Unusual Whales API.
+    Requires UNUSUAL_WHALES_API_KEY env var.
+    Derives bullish/bearish bias from call vs put ask-side premium.
+    Returns sentiment dict or None.
+    """
+    api_key = os.environ.get("UNUSUAL_WHALES_API_KEY")
+    if not api_key or not HAS_REQUESTS:
+        return None
+    try:
+        headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+        resp = _requests.get(
+            f"{UW_API_BASE}/api/option-flow-alerts",
+            headers=headers,
+            params={"ticker_symbol": ticker, "limit": 50},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("data", []) or []
+        if not data:
+            return None
+
+        bull_prem = bear_prem = 0.0
+        for trade in data:
+            prem = float(trade.get("premium") or 0)
+            is_call = str(trade.get("type", "")).lower() == "call"
+            # ask-side call = aggressive bull; ask-side put = aggressive bear
+            side = str(trade.get("ask_side", trade.get("side", ""))).lower()
+            is_ask = side in ("ask", "above_ask", "true", "1")
+            if is_call and is_ask:
+                bull_prem += prem
+            elif not is_call and is_ask:
+                bear_prem += prem
+            elif is_call:
+                bear_prem += prem * 0.5  # bid-side call could be closing
+            else:
+                bull_prem += prem * 0.5  # bid-side put could be closing
+
+        total = bull_prem + bear_prem
+        if total == 0:
+            return None
+        bull_pct = bull_prem / total * 100
+        bias = "BULLISH" if bull_pct >= 60 else "BEARISH" if bull_pct <= 40 else "NEUTRAL"
+        return {"bias": bias, "bull_pct": bull_pct, "n_trades": len(data)}
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Backtest: iron condor win rate over past year
+# ---------------------------------------------------------------------------
+
+def backtest_iron_condor(closes, dte=35):
+    """
+    Walk forward over the past year, selling a ~0.20-delta strangle every DTE days.
+    Uses rolling 30d HV as IV proxy to set short strikes (1.28 sigma = ~0.20 delta).
+    Counts wins (price inside range all DTE days) vs losses (price touches a strike).
+    Returns dict with win_rate, n_trades, avg_credit_pct, or None if too little data.
+    """
+    prices = closes.values
+    n = len(prices)
+    if n < dte * 3:
+        return None
+
+    wins = losses = 0
+    credits = []
+    idx = 21
+
+    while idx + dte <= n:
+        entry = prices[idx]
+        log_rets = np.log(prices[idx - 20:idx] / prices[idx - 21:idx - 1])
+        hv = float(np.std(log_rets) * math.sqrt(TRADING_DAYS))
+        if hv <= 0:
+            idx += dte
             continue
-        if best is None or abs(dte - target_dte) < abs(best_dte - target_dte):
-            best, best_dte = e, dte
-    if best is None:
-        best = expiries[-1]
-        best_dte = (datetime.strptime(best, "%Y-%m-%d").date() - today).days
-    return best, best_dte
+
+        sigma_move = entry * hv * math.sqrt(dte / TRADING_DAYS)
+        upper = entry + 1.28 * sigma_move   # ~0.20 delta call strike
+        lower = entry - 1.28 * sigma_move   # ~0.20 delta put strike
+
+        t = dte / 365.0
+        rfr = 0.045
+        credit_per_share = (_bs_price(entry, upper, t, hv, rfr, "call")
+                            + _bs_price(entry, lower, t, hv, rfr, "put"))
+        credits.append(credit_per_share / entry * 100)
+
+        window = prices[idx:idx + dte]
+        if all(lower <= p <= upper for p in window):
+            wins += 1
+        else:
+            losses += 1
+        idx += dte
+
+    total = wins + losses
+    if total == 0:
+        return None
+    return {
+        "win_rate": wins / total * 100,
+        "n_trades": total,
+        "avg_credit_pct": float(np.mean(credits)) if credits else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Chain preparation
+# ---------------------------------------------------------------------------
+
+def _spread_quality(bid, ask):
+    if pd.notna(bid) and pd.notna(ask) and bid > 0 and ask > 0:
+        mid = (bid + ask) / 2
+        pct = (ask - bid) / mid * 100
+        if pct < 5:
+            return "tight"
+        if pct < 20:
+            return "ok"
+        return "wide"
+    return "?"
 
 
 def prepare_chain(df, spot, t_years, rfr, kind):
-    """Clean one side of the chain; add mid price and Black-Scholes delta."""
     df = df.copy()
-    for col in ("bid", "ask", "lastPrice", "volume", "openInterest",
-                "impliedVolatility"):
+    for col in ("bid", "ask", "lastPrice", "volume", "openInterest", "impliedVolatility"):
         if col not in df:
             df[col] = np.nan
     df["volume"] = df["volume"].fillna(0)
@@ -132,11 +314,22 @@ def prepare_chain(df, spot, t_years, rfr, kind):
         return lp if pd.notna(lp) and lp > 0 else np.nan
 
     df["mid"] = df.apply(midprice, axis=1)
-    df["delta"] = df.apply(
-        lambda row: bs_delta(spot, row["strike"], t_years,
-                             row["impliedVolatility"], rfr, kind), axis=1)
+    df["spread_quality"] = df.apply(
+        lambda r: _spread_quality(r["bid"], r["ask"]), axis=1)
+
+    greek_rows = []
+    for _, row in df.iterrows():
+        iv = row.get("impliedVolatility", 0) or 0
+        g = bs_greeks(spot, row["strike"], t_years, iv, rfr, kind)
+        greek_rows.append({
+            "delta": g.get("delta"),
+            "gamma": g.get("gamma"),
+            "theta": g.get("theta"),
+            "vega": g.get("vega"),
+        })
+    df = pd.concat([df, pd.DataFrame(greek_rows, index=df.index)], axis=1)
     df = df.dropna(subset=["mid", "delta"])
-    df = df[df["impliedVolatility"] > 0.01]
+    df = df[df["impliedVolatility"].fillna(0) > 0.01]
 
     liquid = df[(df["openInterest"] >= 10) | (df["volume"] >= 5)]
     out = liquid if len(liquid) >= 5 else df
@@ -160,12 +353,10 @@ def atm_row(df, spot):
 
 
 def wing_row(df, short_strike, direction, steps=2):
-    """Pick a long 'wing' a couple of strikes beyond the short strike."""
     strikes = df["strike"].tolist()
     if short_strike not in strikes:
         return None
-    idx = strikes.index(short_strike) + direction * steps
-    idx = max(0, min(len(strikes) - 1, idx))
+    idx = max(0, min(len(strikes) - 1, strikes.index(short_strike) + direction * steps))
     if strikes[idx] == short_strike:
         return None
     return df[df["strike"] == strikes[idx]].iloc[0]
@@ -179,7 +370,7 @@ def common_atm_strike(calls, puts, spot):
 
 
 # ---------------------------------------------------------------------------
-# Formatting
+# Formatting helpers
 # ---------------------------------------------------------------------------
 
 def money(x):
@@ -187,14 +378,52 @@ def money(x):
     return f"{sign}${abs(x):,.2f}"
 
 
-def leg(action, row, expiry, kind):
+def _safe(v):
+    return v is not None and not (isinstance(v, float) and math.isnan(v))
+
+
+def _net_greeks(*legs):
+    """Sum greeks. Each leg = (sign, row). sign=+1 long, -1 short."""
+    total = {"theta": 0.0, "vega": 0.0, "gamma": 0.0}
+    for sign, row in legs:
+        for g in total:
+            v = row.get(g)
+            if v is not None:
+                try:
+                    total[g] += sign * float(v)
+                except (TypeError, ValueError):
+                    pass
+    return total
+
+
+def _fmt_net(ng):
+    # scale to per-contract (100 shares)
+    parts = [
+        f"θ {ng['theta']*100:+.2f}$/day",
+        f"ν {money(ng['vega']*100)}/1%IV",
+        f"γ {ng['gamma']:+.5f}",
+    ]
+    return "  |  ".join(parts)
+
+
+def leg_str(action, row, expiry, kind):
+    q = row.get("spread_quality", "?")
+    theta = row.get("theta")
+    vega = row.get("vega")
+    extras = []
+    if _safe(theta):
+        extras.append(f"θ {theta*100:+.2f}$/day")
+    if _safe(vega):
+        extras.append(f"ν {money(vega*100)}/1%IV")
+    greek_str = ("  " + "  ".join(extras)) if extras else ""
     return (f"   {action:<4} 1x {expiry} {row['strike']:g}{kind[0].upper()} "
-            f"@ {money(row['mid'])}   "
-            f"(delta {row['delta']:+.2f}, OI {int(row['openInterest']):,})")
+            f"@ {money(row['mid'])}  "
+            f"(δ {row['delta']:+.2f}{greek_str}, OI {int(row['openInterest']):,}, "
+            f"spread {q})")
 
 
 # ---------------------------------------------------------------------------
-# Strategy builders -- each returns a printable block or None
+# Strategy builders
 # ---------------------------------------------------------------------------
 
 def covered_call(spot, calls, expiry, dte):
@@ -206,16 +435,18 @@ def covered_call(spot, calls, expiry, dte):
     max_profit = (K - spot + prem) * 100
     yld = prem / spot
     ann = yld * 365 / max(dte, 1)
+    ng = _net_greeks((-1, row))
     return "\n".join([
         "COVERED CALL   (income / mildly bullish)",
         f"   BUY  100 shares @ {money(spot)}",
-        leg("SELL", row, expiry, "call"),
+        leg_str("SELL", row, expiry, "call"),
         f"   Net outlay:     {money(outlay)}",
-        f"   Max profit:     {money(max_profit)} (shares called away above {K:g})",
-        f"   Max loss:       {money(outlay)} (stock to zero, cushioned by premium)",
+        f"   Max profit:     {money(max_profit)}  (called away above {K:g})",
+        f"   Max loss:       {money(outlay)}  (stock to zero)",
         f"   Breakeven:      {money(spot - prem)}",
-        f"   Premium yield:  {yld*100:.2f}% ({ann*100:.1f}% annualized)",
-        f"   Approx. prob. of assignment: {row['delta']*100:.0f}%",
+        f"   Premium yield:  {yld*100:.2f}%  ({ann*100:.1f}% annualized)",
+        f"   Net greeks:     {_fmt_net(ng)}",
+        f"   Prob of assign: ~{row['delta']*100:.0f}%",
     ])
 
 
@@ -226,15 +457,17 @@ def cash_secured_put(spot, puts, expiry, dte):
     prem, K = row["mid"], row["strike"]
     yld = prem / K
     ann = yld * 365 / max(dte, 1)
+    ng = _net_greeks((-1, row))
     return "\n".join([
         "CASH-SECURED PUT   (income / willing to buy the dip)",
-        leg("SELL", row, expiry, "put"),
+        leg_str("SELL", row, expiry, "put"),
         f"   Collateral:     {money(K * 100)} cash set aside",
-        f"   Max profit:     {money(prem * 100)} (expires worthless above {K:g})",
-        f"   Max loss:       {money((K - prem) * 100)} (stock to zero, assigned at {K:g})",
+        f"   Max profit:     {money(prem * 100)}  (expires worthless above {K:g})",
+        f"   Max loss:       {money((K - prem) * 100)}  (stock to zero)",
         f"   Breakeven:      {money(K - prem)}",
-        f"   Premium yield:  {yld*100:.2f}% on collateral ({ann*100:.1f}% annualized)",
-        f"   Approx. prob. of keeping full premium: {(1 - abs(row['delta']))*100:.0f}%",
+        f"   Premium yield:  {yld*100:.2f}%  ({ann*100:.1f}% annualized)",
+        f"   Net greeks:     {_fmt_net(ng)}",
+        f"   Prob keep prem: ~{(1 - abs(row['delta']))*100:.0f}%",
     ])
 
 
@@ -251,15 +484,17 @@ def bull_call_spread(spot, calls, expiry):
     max_profit = (width - debit) * 100
     if max_profit <= 0:
         return None
+    ng = _net_greeks((+1, long_row), (-1, short_row))
     return "\n".join([
         "BULL CALL SPREAD   (defined-risk bullish)",
-        leg("BUY", long_row, expiry, "call"),
-        leg("SELL", short_row, expiry, "call"),
+        leg_str("BUY", long_row, expiry, "call"),
+        leg_str("SELL", short_row, expiry, "call"),
         f"   Net debit:      {money(debit * 100)}",
-        f"   Max profit:     {money(max_profit)} above {short_row['strike']:g}",
-        f"   Max loss:       {money(debit * 100)} below {long_row['strike']:g}",
+        f"   Max profit:     {money(max_profit)}  above {short_row['strike']:g}",
+        f"   Max loss:       {money(debit * 100)}  below {long_row['strike']:g}",
         f"   Breakeven:      {money(long_row['strike'] + debit)}",
         f"   Reward/risk:    {max_profit / (debit * 100):.2f}x",
+        f"   Net greeks:     {_fmt_net(ng)}",
     ])
 
 
@@ -276,15 +511,17 @@ def bear_put_spread(spot, puts, expiry):
     max_profit = (width - debit) * 100
     if max_profit <= 0:
         return None
+    ng = _net_greeks((+1, long_row), (-1, short_row))
     return "\n".join([
         "BEAR PUT SPREAD   (defined-risk bearish)",
-        leg("BUY", long_row, expiry, "put"),
-        leg("SELL", short_row, expiry, "put"),
+        leg_str("BUY", long_row, expiry, "put"),
+        leg_str("SELL", short_row, expiry, "put"),
         f"   Net debit:      {money(debit * 100)}",
-        f"   Max profit:     {money(max_profit)} below {short_row['strike']:g}",
-        f"   Max loss:       {money(debit * 100)} above {long_row['strike']:g}",
+        f"   Max profit:     {money(max_profit)}  below {short_row['strike']:g}",
+        f"   Max loss:       {money(debit * 100)}  above {long_row['strike']:g}",
         f"   Breakeven:      {money(long_row['strike'] - debit)}",
         f"   Reward/risk:    {max_profit / (debit * 100):.2f}x",
+        f"   Net greeks:     {_fmt_net(ng)}",
     ])
 
 
@@ -307,19 +544,19 @@ def iron_condor(spot, calls, puts, expiry):
     if max_loss <= 0:
         return None
     pop = max(0.0, 1 - (sc["delta"] + abs(sp["delta"])))
+    ng = _net_greeks((-1, sc), (+1, lc), (-1, sp), (+1, lp))
     return "\n".join([
         "IRON CONDOR   (defined-risk neutral, collects premium)",
-        leg("SELL", sp, expiry, "put"),
-        leg("BUY", lp, expiry, "put"),
-        leg("SELL", sc, expiry, "call"),
-        leg("BUY", lc, expiry, "call"),
+        leg_str("SELL", sp, expiry, "put"),
+        leg_str("BUY", lp, expiry, "put"),
+        leg_str("SELL", sc, expiry, "call"),
+        leg_str("BUY", lc, expiry, "call"),
         f"   Net credit:     {money(credit * 100)}",
-        f"   Max profit:     {money(credit * 100)} between "
-        f"{sp['strike']:g} and {sc['strike']:g}",
+        f"   Max profit:     {money(credit * 100)}  between {sp['strike']:g} and {sc['strike']:g}",
         f"   Max loss:       {money(max_loss)}",
-        f"   Breakevens:     {money(sp['strike'] - credit)} / "
-        f"{money(sc['strike'] + credit)}",
-        f"   Approx. prob. of profit: {pop*100:.0f}%",
+        f"   Breakevens:     {money(sp['strike'] - credit)} / {money(sc['strike'] + credit)}",
+        f"   Prob of profit: ~{pop*100:.0f}%",
+        f"   Net greeks:     {_fmt_net(ng)}",
     ])
 
 
@@ -332,19 +569,45 @@ def long_straddle(calls, puts, spot, expiry, exp_move):
     debit = c["mid"] + p["mid"]
     if debit <= 0:
         return None
+    ng = _net_greeks((+1, c), (+1, p))
     lines = [
         "LONG STRADDLE   (expects a big move, direction unknown)",
-        leg("BUY", c, expiry, "call"),
-        leg("BUY", p, expiry, "put"),
-        f"   Net debit:      {money(debit * 100)} (= max loss if pinned at {K:g})",
+        leg_str("BUY", c, expiry, "call"),
+        leg_str("BUY", p, expiry, "put"),
+        f"   Net debit:      {money(debit * 100)}  (= max loss if pinned at {K:g})",
         f"   Breakevens:     {money(K - debit)} / {money(K + debit)}",
-        f"   Needs a move bigger than {money(debit)} "
-        f"({debit / spot * 100:.1f}%) by expiry to profit",
+        f"   Needs a move:   >{money(debit)} ({debit/spot*100:.1f}%) by expiry",
+        f"   Net greeks:     {_fmt_net(ng)}",
     ]
     if exp_move:
-        lines.append(f"   Market-implied expected move: +/- {money(exp_move)} "
-                     f"({exp_move / spot * 100:.1f}%)")
+        lines.append(
+            f"   Expected move:  +/- {money(exp_move)} ({exp_move/spot*100:.1f}%)")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Expiry selection
+# ---------------------------------------------------------------------------
+
+def choose_expiry(expiries, target_dte, explicit=None):
+    today = date.today()
+    if explicit:
+        if explicit not in expiries:
+            sys.exit(f"Expiry {explicit} not available. Choices:\n  "
+                     + "\n  ".join(expiries[:14]))
+        d = datetime.strptime(explicit, "%Y-%m-%d").date()
+        return explicit, (d - today).days
+    best, best_dte = None, None
+    for e in expiries:
+        dte = (datetime.strptime(e, "%Y-%m-%d").date() - today).days
+        if dte < 7:
+            continue
+        if best is None or abs(dte - target_dte) < abs(best_dte - target_dte):
+            best, best_dte = e, dte
+    if best is None:
+        best = expiries[-1]
+        best_dte = (datetime.strptime(best, "%Y-%m-%d").date() - today).days
+    return best, best_dte
 
 
 # ---------------------------------------------------------------------------
@@ -352,18 +615,17 @@ def long_straddle(calls, puts, spot, expiry, exp_move):
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Options strategy scanner using live Yahoo Finance data.")
+    ap = argparse.ArgumentParser(description="Options strategy scanner.")
     ap.add_argument("ticker", help="stock or ETF symbol, e.g. AAPL")
     ap.add_argument("--dte", type=int, default=35,
                     help="target days to expiry (default 35)")
-    ap.add_argument("--expiry", help="exact expiry date, YYYY-MM-DD")
+    ap.add_argument("--expiry", help="exact expiry date YYYY-MM-DD")
     args = ap.parse_args()
     ticker = args.ticker.upper()
 
     print(f"Fetching data for {ticker} ...")
     rfr = get_risk_free_rate()
-    tk, spot, hv30, hv1y, sma50, expiries = fetch_underlying(ticker)
+    tk, spot, hv30, hv1y, sma50, closes, expiries = fetch_underlying(ticker)
     expiry, dte = choose_expiry(expiries, args.dte, args.expiry)
     t_years = max(dte, 1) / 365.0
 
@@ -373,44 +635,99 @@ def main():
     if calls.empty or puts.empty:
         sys.exit("Option chain too thin at this expiry. Try another --expiry.")
 
-    # Volatility snapshot
-    ivs = [r["impliedVolatility"] for r in (atm_row(calls, spot),
-                                            atm_row(puts, spot)) if r is not None]
-    atm_iv = float(np.mean(ivs)) if ivs else float("nan")
-    exp_move = (spot * atm_iv * math.sqrt(t_years)
-                if not math.isnan(atm_iv) else None)
+    # ATM IV and expected move
+    iv_rows = [r for r in (atm_row(calls, spot), atm_row(puts, spot))
+               if r is not None and pd.notna(r.get("impliedVolatility"))]
+    atm_iv = float(np.mean([r["impliedVolatility"] for r in iv_rows])) if iv_rows else float("nan")
+    exp_move = spot * atm_iv * math.sqrt(t_years) if not math.isnan(atm_iv) else None
+
+    # IV / HV regime
     iv_hv = atm_iv / hv30 if hv30 and not math.isnan(atm_iv) else float("nan")
-
     if not math.isnan(iv_hv) and iv_hv >= 1.2:
-        regime = ("RICH -- options look pricey vs realized vol. "
-                  "Edge favors SELLING premium\n   (covered call, "
-                  "cash-secured put, iron condor).")
+        regime = "RICH -- options pricey vs realized vol  ->  edge: SELL premium"
     elif not math.isnan(iv_hv) and iv_hv <= 0.8:
-        regime = ("CHEAP -- options look inexpensive vs realized vol. "
-                  "Edge favors BUYING\n   (debit spreads, long straddle).")
+        regime = "CHEAP -- options cheap vs realized vol  ->  edge: BUY premium"
     else:
-        regime = ("FAIR -- no strong edge from IV alone. Lean on your "
-                  "directional view\n   and keep position sizes small.")
+        regime = "FAIR -- no strong IV edge; lean on directional view"
 
+    # IV Rank / Percentile
+    iv_rank, iv_pct = (get_iv_rank(closes, atm_iv)
+                       if not math.isnan(atm_iv) else (float("nan"), float("nan")))
+    if not math.isnan(iv_rank):
+        ivr_call = ("SELL premium (IVR elevated)" if iv_rank >= 50
+                    else "BUY premium (IVR depressed)")
+    else:
+        ivr_call = ""
+
+    # Earnings check
+    earnings_date = get_earnings_date(tk)
+    expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+    today = date.today()
+    earnings_warning = None
+    if earnings_date:
+        days_to_earn = (earnings_date - today).days
+        if earnings_date <= expiry_date:
+            earnings_warning = (
+                f"!! EARNINGS {earnings_date} ({days_to_earn}d) is BEFORE expiry -- "
+                "IV crush risk for sellers; gap risk for both sides")
+        else:
+            earnings_safe = f"next earnings {earnings_date} ({days_to_earn}d) is after expiry -- OK"
+
+    # Unusual Whales flow
+    uw = get_unusual_flow(ticker)
+
+    # Trend
     trend = "ABOVE" if spot >= sma50 else "BELOW"
 
+    # Backtest
+    bt = backtest_iron_condor(closes, dte=35)
+
+    # -----------------------------------------------------------------------
+    # Print header
+    # -----------------------------------------------------------------------
     print()
-    print("=" * 64)
+    print("=" * 72)
     print(f" OPTIONS STRATEGY SCANNER -- {ticker}")
-    print("=" * 64)
-    print(f" Date:           {date.today()}      Risk-free rate: {rfr*100:.2f}%")
-    print(f" Spot price:     {money(spot)}")
-    print(f" 50-day SMA:     {money(sma50)}  (trading {trend} trend line)")
-    print(f" Expiry used:    {expiry}  ({dte} DTE)")
+    print("=" * 72)
+    print(f" Date:           {today}   Risk-free rate: {rfr*100:.2f}%")
+    print(f" Spot:           {money(spot)}")
+    print(f" 50d SMA:        {money(sma50)}  (trading {trend} trend)")
+    print(f" Expiry:         {expiry}  ({dte} DTE)")
+
     if not math.isnan(atm_iv):
-        print(f" ATM implied vol: {atm_iv*100:.1f}%   "
-              f"Expected move: +/- {money(exp_move)} "
-              f"({exp_move/spot*100:.1f}%)")
+        print(f" ATM IV:         {atm_iv*100:.1f}%  |  "
+              f"Expected move ±{money(exp_move)} ({exp_move/spot*100:.1f}%)")
     print(f" Realized vol:   30d {hv30*100:.1f}%  |  1y {hv1y*100:.1f}%")
     if not math.isnan(iv_hv):
-        print(f" IV / HV(30d):   {iv_hv:.2f}x -> {regime}")
+        print(f" IV/HV(30d):     {iv_hv:.2f}x  ->  {regime}")
+    if not math.isnan(iv_rank):
+        print(f" IV Rank:        {iv_rank:.0f}  |  IV Pct: {iv_pct:.0f}%  ->  {ivr_call}")
+
+    if earnings_warning:
+        print(f" Earnings:       {earnings_warning}")
+    elif earnings_date:
+        print(f" Earnings:       {earnings_safe}")
+
+    if uw:
+        print(f" UW Flow:        {uw['bias']}  "
+              f"({uw['bull_pct']:.0f}% bull / {100-uw['bull_pct']:.0f}% bear "
+              f"premium, {uw['n_trades']} prints)")
+    elif os.environ.get("UNUSUAL_WHALES_API_KEY"):
+        print(" UW Flow:        no flow data returned for this ticker")
+    else:
+        print(" UW Flow:        set UNUSUAL_WHALES_API_KEY for flow sentiment")
+
+    if bt:
+        print(f" Backtest 1y:    iron condor (35 DTE, ~0.20δ) -- "
+              f"win rate {bt['win_rate']:.0f}%  |  "
+              f"{bt['n_trades']} trades  |  "
+              f"avg credit ~{bt['avg_credit_pct']:.2f}% of spot")
+
     print(SEP)
 
+    # -----------------------------------------------------------------------
+    # Strategies
+    # -----------------------------------------------------------------------
     builders = [
         lambda: covered_call(spot, calls, expiry, dte),
         lambda: cash_secured_put(spot, puts, expiry, dte),
@@ -429,16 +746,17 @@ def main():
             print(block)
             print(SEP)
             shown += 1
+
     if shown == 0:
         print("No viable strategies found (chain too illiquid). "
-              "Try a more liquid ticker or different expiry.")
+              "Try a more liquid ticker or a different --expiry.")
 
-    print("NOTES & ASSUMPTIONS")
-    print(" - Prices use bid/ask midpoints (or last trade when quotes are")
-    print("   missing); real fills will be worse. Fees not included.")
-    print(" - Deltas are Black-Scholes estimates -- rough probability")
-    print("   proxies only. Dividends and early assignment are ignored.")
-    print(" - Educational output only. Not financial advice.")
+    print("NOTES")
+    print(" - Prices use bid/ask midpoints; real fills will be worse. Fees not included.")
+    print(" - Greeks are Black-Scholes estimates (European, no dividend adjustment).")
+    print(" - theta/vega shown per contract (100 shares).")
+    print(" - Backtest uses rolling realized vol as IV proxy -- approximation only.")
+    print(" - UW flow is indicative, not predictive. Not financial advice.")
 
 
 if __name__ == "__main__":
