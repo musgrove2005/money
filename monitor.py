@@ -13,9 +13,15 @@ Setup:
 Run in background:
     python monitor.py &
     python monitor.py --min-score 60 --min-premium 100000
+    python monitor.py --watchlist tech,semis,etfs
+    python monitor.py --watchlist all
     python monitor.py --tickers AAPL,NVDA,SPY,QQQ
     python monitor.py --calls-only
     python monitor.py --puts-only
+
+Available watchlists: etfs, megacap, tech, semis, cloud, financials,
+  healthcare, energy, consumer, defense, crypto, china, momentum,
+  earnings_volatile, core, aggressive, macro, all
 
 Stop it:
     kill %1       (if backgrounded with &)
@@ -27,6 +33,12 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+
+try:
+    from watchlists import resolve as resolve_watchlist, WATCHLISTS
+    HAS_WATCHLISTS = True
+except ImportError:
+    HAS_WATCHLISTS = False
 
 try:
     import requests
@@ -226,6 +238,8 @@ def main():
                     help=f"minimum significance score to alert (default {DEFAULT_MIN_SCORE})")
     ap.add_argument("--min-premium", type=int, default=DEFAULT_MIN_PREMIUM,
                     help=f"minimum premium $ (default {DEFAULT_MIN_PREMIUM:,})")
+    ap.add_argument("--watchlist",
+                    help="watchlist name(s), comma-separated: tech,semis,etfs  (see watchlists.py)")
     ap.add_argument("--tickers", help="comma-separated tickers to watch, e.g. AAPL,NVDA")
     ap.add_argument("--calls-only", action="store_true")
     ap.add_argument("--puts-only", action="store_true")
@@ -237,13 +251,21 @@ def main():
     if not api_key:
         sys.exit("Set UNUSUAL_WHALES_API_KEY environment variable first.")
 
-    tickers = [t.strip().upper() for t in args.tickers.split(",")] if args.tickers else None
+    tickers = None
+    if args.watchlist and HAS_WATCHLISTS:
+        tickers = resolve_watchlist([w.strip() for w in args.watchlist.split(",")])
+    elif args.watchlist:
+        print("watchlists.py not found -- ignoring --watchlist flag")
+    if args.tickers:
+        extra = [t.strip().upper() for t in args.tickers.split(",")]
+        tickers = sorted(set((tickers or []) + extra))
 
     seen_ids = set()       # deduplicate across polls
     poll_count = 0
     alert_count = 0
 
-    watch_str = f" watching {', '.join(tickers)}" if tickers else " watching all tickers"
+    watch_str = (f" watching {len(tickers)} tickers ({args.watchlist or 'custom'})"
+                 if tickers else " watching all tickers")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Flow monitor started --{watch_str}")
     print(f"  Poll every {POLL_INTERVAL}s  |  min score {args.min_score}  |  "
           f"min premium ${args.min_premium:,}")
