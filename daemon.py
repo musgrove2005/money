@@ -178,6 +178,10 @@ def check_flow(state, api_key, min_score, min_premium, tickers,
 
         score, reasons = _flow_score(t)
         if score < min_score:
+            if state.get("verbose"):
+                ticker = str(t.get("ticker_symbol") or "?").upper()
+                prem   = float(t.get("premium") or 0)
+                print(f"  [{now_str()}] skip {ticker} {_fmt_prem(prem)} score={score} (threshold {min_score})")
             continue
 
         direction = _flow_direction(t)
@@ -516,8 +520,16 @@ def main():
                     help="disable auto-scanner on flow alerts")
     ap.add_argument("--no-positions", action="store_true",
                     help="disable Robinhood position monitor")
-    ap.add_argument("--verbose",     action="store_true")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print every poll result even if below threshold")
+    ap.add_argument("--test", action="store_true",
+                    help="set score=0 and premium=0 to see all raw flow (confirm API is working)")
     args = ap.parse_args()
+
+    if args.test:
+        args.min_score   = 0
+        args.min_premium = 0
+        print("[test mode] showing all flow regardless of score or premium")
 
     api_key = os.environ.get("UNUSUAL_WHALES_API_KEY")
     if not api_key:
@@ -578,15 +590,21 @@ def main():
     print(f"  Ctrl+C to stop")
     print(f"{'='*62}\n")
 
-    poll_count = 0
+    poll_count  = 0
+    alert_count = 0
+    last_heartbeat = time.time()
+
     try:
         while True:
             now = time.time()
 
             if now - last["flow"] >= INTERVALS["flow"]:
+                before = len(state["flow_seen"])
                 check_flow(state, api_key, args.min_score, args.min_premium,
                            tickers, args.calls_only, args.puts_only,
                            not args.no_scanner)
+                new_prints = len(state["flow_seen"]) - before
+                state["last_new_prints"] = new_prints
                 last["flow"] = now
 
             if now - last["darkpool"] >= INTERVALS["darkpool"]:
@@ -611,16 +629,18 @@ def main():
 
             poll_count += 1
 
-            # Heartbeat every ~5 min
-            if poll_count % 1000 == 0:
-                tide = state.get("tide_bull_pct")
-                tide_str = f"  Tide: {tide:.0f}% bull" if tide else ""
-                print(f"  [{now_str()}] alive -- {poll_count} ticks{tide_str}")
+            # Heartbeat every 60 seconds
+            if now - last_heartbeat >= 60:
+                tide     = state.get("tide_bull_pct")
+                tide_str = f"  tide {tide:.0f}% bull" if tide is not None else ""
+                new_str  = f"  +{state.get('last_new_prints', 0)} new prints"
+                print(f"  [{now_str()}] scanning -- {len(state['flow_seen'])} prints seen{new_str}{tide_str}")
+                last_heartbeat = now
 
             time.sleep(0.5)
 
     except KeyboardInterrupt:
-        print(f"\n[{now_str()}] Daemon stopped after {poll_count} ticks.")
+        print(f"\n[{now_str()}] Daemon stopped. {poll_count} ticks, {len(state['flow_seen'])} total prints seen.")
 
 
 if __name__ == "__main__":
